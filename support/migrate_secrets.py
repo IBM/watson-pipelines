@@ -342,7 +342,7 @@ def generate_token(args):
 
 def get_service_broker_token_from_secret(args):
     get_secret_cmd = [args.oc_path, "-n", args.namespace, "get", "secret", "zen-service-broker-secret", "--output", "json"]
-    result = subprocess.run(get_secret_cmd, check=True, capture_output=True)
+    result = subprocess.run(get_secret_cmd, check=True, stdout=subprocess.PIPE)
     service_secret = json.loads(result.stdout)
     token_encoded = service_secret.get("data", {}).get("token", None)
     if token_encoded is None:
@@ -352,7 +352,7 @@ def get_service_broker_token_from_secret(args):
 
 def get_couchdb_credentials_from_secret(args):
     get_secret_cmd = [args.oc_path, "-n", args.namespace, "get", "secret", "wdp-couchdb", "--output", "json"]
-    result = subprocess.run(get_secret_cmd, check=True, capture_output=True)
+    result = subprocess.run(get_secret_cmd, check=True, stdout=subprocess.PIPE)
     service_secret = json.loads(result.stdout)
     adminPassword64 = service_secret.get("data", {}).get("adminPassword", None)
     adminUsername64 = service_secret.get("data", {}).get("adminUsername", None)
@@ -379,7 +379,7 @@ def forward_couchdb_port(args):
 
 def get_couchdb_url_from_secret(args, namespace):
     get_secret_cmd = [args.oc_path, "-n", namespace, "get", "secret", "couchdb-url", "--output", "json"]
-    result = subprocess.run(get_secret_cmd, check=True, capture_output=True)
+    result = subprocess.run(get_secret_cmd, check=True, stdout=subprocess.PIPE)
     service_secret = json.loads(result.stdout)
     adminPassword = service_secret.get("data", {}).get("adminPassword", None)
     adminUsername = service_secret.get("data", {}).get("adminUsername", None)
