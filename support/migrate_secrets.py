@@ -429,14 +429,20 @@ def run_migration(args):
         pipelines = get_all_pipelines(args, admin_token, project_id)
         if pipelines == {}:
             continue
+        for asset_id, flow in pipelines.items():
+            with open(f"{PIPELINES_DIR}/{asset_id}.json", "w") as f:
+                f.write(json.dumps(flow, indent=2))
         primary_pipelines = {flow['primary_pipeline']: asset_id for asset_id, flow in pipelines.items()}
         members = get_project_members(args, admin_token, project_id)
+        credentials = get_all_user_credentials(args, project_id, None, admin_token)
+        print("\tCredentials:")
+        for c in credentials:
+            print(f"\t{c}")
         for member in members:
             uid = member.get('id')
             username = member.get("user_name")
             print(f"\tProcessing member {uid}: {username}")
             user_token = get_user_token(args, uid, username)
-            credentials = get_all_user_credentials(args, project_id, None, user_token)
             for credential in credentials:
                 owner = credential.get('owner', {})
                 if owner['user_id'] == username:
@@ -456,6 +462,8 @@ def run_migration(args):
                         print(f"\t\tPatched credentials {id}: {patched_credentials}")
                       else:
                         print("\t\tProject scope already set")
+                    else:
+                      print("\t\tPipeline with primary ID {} not found".format(primary_pipeline))
 
     print("Done processing all projects")
 
