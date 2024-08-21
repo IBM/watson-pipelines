@@ -24,13 +24,16 @@ import socketserver
 import requests
 from requests.adapters import HTTPAdapter
 import urllib3
+from datetime import datetime
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 PIPELINES_DIR = "pipelines"
+PROJECTS_DIR = "projects"
 CPD_INSTANCE = "cpd-instance"
 CPD_ADMIN_ID = "1000331001"
 CPD_ADMIN_NAME = "cpadmin"
+CREDENTIALS_DIR = "creds"
 
 session = requests.Session()
 retry = urllib3.Retry(connect=3, backoff_factor=0.5)
@@ -407,11 +410,125 @@ def patch_credentials_scope(args, credential_id, project_id):
     if response.ok is False:
         raise Exception("Failed to put user credential. Reason: {}".format(response.text))
     return response.json()
+ 
+def get_credentials_for_asset(args, asset_id):
+    url = f"https://127.0.0.1:{args.couchdb_proxy_port}/task-credentials/_find"
+    query={
+      "selector": {
+        "$and": [
+          {
+            "scope.job_id": {
+              "$exists": False
+            }
+          },
+          {
+            "scope.asset_id": asset_id
+          }
+        ]
+      },
+      "limit": 3000
+    }
+    response = session.post(
+        url,
+        headers={'Authorization': f'Basic {args.couchdb_credentials}'},
+        json=query
+    )
+    if response.ok is False:
+        raise Exception("Failed to put get credential. Reason: {}".format(response.text))
+    return response.json()["docs"]
+
+def prepare_migration_secret(args, token):
+    fixed_asset_id = 'migration_helper'
+    url = f"https://127.0.0.1:{args.couchdb_proxy_port}/task-credentials/_find"
+    query={
+      "selector": {
+        "scope.asset_id": fixed_asset_id
+      }
+    }
+    response = session.post(
+        url,
+        headers={'Authorization': f'Basic {args.couchdb_credentials}'},
+        json=query
+    )
+    if response.ok is False:
+        raise Exception("Failed to check helper credentials. Reason: {}".format(response.text))
+    found = response.json()["docs"]
+    if len(found) > 0:
+        return found[0]["secret_id"]
+    
+    url = f"{args.host}/v1/task_credentials"
+    payload = {
+    "name": fixed_asset_id,
+    "type": "parameters",
+    "secret":{},
+    "scope": {"asset_id": fixed_asset_id}
+    }
+
+    response = session.post(
+        url,
+        headers={'Authorization': f'Bearer {token}'},
+        json=payload
+    )
+    if response.ok is False:
+        raise Exception("Failed to get create helper credentials. Reason: {}".format(response.text))
+    return prepare_migration_secret(args)
+
+def prepare_fixed_secret(args, token, migration_helper_secret, asset_id, project_id):
+    current_timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
+    data = {
+      "created_at": current_timestamp,
+      "creator_id": "",
+      "name": "orchestration_flow_parameters_migrated",
+      "owner": {
+        "user_id": args.user_name
+      },
+      "scope": {
+        "asset_id": asset_id,
+        "project_id": project_id
+      },
+      "secret_id": migration_helper_secret,
+      "type": "parameters",
+      "updated_at": current_timestamp
+    }
+    fixed_asset_id = 'migration_helper'
+    url = f"https://127.0.0.1:{args.couchdb_proxy_port}/task-credentials"
+    response = session.post(
+        url,
+        headers={'Authorization': f'Basic {args.couchdb_credentials}'},
+        json=data
+    )
+    if response.ok is False:
+        raise Exception("Failed to check helper credentials. Reason: {}".format(response.text))
+    new_id = response.json()["id"]
+
+    print(f"created record for asset {asset_id} and project {project_id}: ${new_id}")
+    url = f"{args.host}/v1/task_credentials/{new_id}"
+    payload = [{
+        "op":"replace",
+        "path":"/secret",
+        "value": {
+            "key":"{plainval}migrated"
+        }
+    }]
+
+    response = session.patch(
+        url,
+        headers={'Authorization': f'Bearer {token}'},
+        json=payload
+    )
+    if response.ok is False:
+        raise Exception("Failed to get create helper credentials. Reason: {}".format(response.text))
+    print(f"record ${new_id} patched : {response.json()}")
 
 
 def run_migration(args):
     admin_token = args.user_token
-    pathlib.Path(PIPELINES_DIR).mkdir(parents=True, exist_ok=True)
+    pathlib.Path(f"{CREDENTIALS_DIR}").mkdir(parents=True, exist_ok=True)
+
+    allAffected = {}
+
+    migration_helper_secret = prepare_migration_secret(args, admin_token)
+    print(f"migration_helper_secret = {migration_helper_secret}")
 
     if args.project_id is None:
         projects = get_all_projects(args, admin_token)
@@ -426,46 +543,54 @@ def run_migration(args):
             continue
 
         print(f"Processing project {project_id}")
+        pathlib.Path(f"{PROJECTS_DIR}/{project_id}/{PIPELINES_DIR}").mkdir(parents=True, exist_ok=True)
         pipelines = get_all_pipelines(args, admin_token, project_id)
         if pipelines == {}:
             continue
         for asset_id, flow in pipelines.items():
-            with open(f"{PIPELINES_DIR}/{asset_id}.json", "w") as f:
-                f.write(json.dumps(flow, indent=2))
+            dump = json.dumps(flow, indent=2)
+            with open(f"{PROJECTS_DIR}/{project_id}/{PIPELINES_DIR}/{asset_id}.json", "w") as f:
+                f.write(dump)
+            hasSecref = "{secref}" in dump
+            hasEncval = "{encval}" in dump   
+            primary_pipeline_id = flow['primary_pipeline'] 
+            print(f"pipeline: {asset_id}, primary_pipeline_id: {primary_pipeline_id}, secret refs: {hasSecref}, encrypted vals: {hasEncval}")
+            if hasSecref or hasEncval:
+                affected = {
+                    "primary_pipeline_id": primary_pipeline_id,
+                    "hasSecref": hasSecref,
+                    "hasEncval": hasEncval,
+                    "projects": [project_id]
+                }
+                if primary_pipeline_id not in allAffected:
+                    allAffected[primary_pipeline_id] = affected  
+                else:
+                    existing = allAffected[primary_pipeline_id]
+                    existing["hasSecref"] = existing["hasSecref"] or affected["hasSecref"]
+                    existing["hasEncval"] = existing["hasEncval"] or affected["hasEncval"]
+                    existing["projects"].append(project_id)
+
+                
         primary_pipelines = {flow['primary_pipeline']: asset_id for asset_id, flow in pipelines.items()}
-        members = get_project_members(args, admin_token, project_id)
-        for member in members:
-            uid = member.get('id')
-            username = member.get("user_name")
-            print(f"\tProcessing member {uid}: {username}")
-            user_token = get_user_token(args, uid, username)
-            credentials = get_all_user_credentials(args, None, None, user_token)
-            print(f"\tUser {username} ({uid}) credentials:")
-            for c in credentials:
-                print(f"\t{c}")
-            for credential in credentials:
-                owner = credential.get('owner', {})
-                if owner['user_id'] == username:
-                    scope = credential.get('scope', {})
-                    id = credential.get('id')
-                    name = credential.get('name')
-                    secret = get_secret(args, id, user_token)
-                    primary_pipeline = scope.get('asset_id')
-                    asset_id = primary_pipelines.get(primary_pipeline)
-                    if asset_id is not None:
-                      print(f"\t\tProcessing credential {credential}")
-                      print(f"\t\tSecret {id}: {secret}")
+        print(f"project: {project_id} - done")
 
-                      if 'project_id' not in scope:
-                        patch_response = patch_credentials_scope(args, id, project_id)
-                        patched_credentials = get_credentials_by_id(args, id, user_token)
-                        print(f"\t\tPatched credentials {id}: {patched_credentials}")
-                      else:
-                        print("\t\tProject scope already set")
-                    else:
-                      print("\t\tPipeline with primary ID {} not found".format(primary_pipeline))
+    print(f"projects - done") 
+    for ppid in allAffected:
+        print(f"affected pipeline: {allAffected[ppid]}")
+        creds = get_credentials_for_asset(args, ppid)
+        dump=json.dumps(creds)
+        with open(f"{CREDENTIALS_DIR}/{ppid}_secrets.json", "w") as f:
+            f.write(dump) 
 
-    print("Done processing all projects")
+    print("affected - done")
+
+    if args.id_to_fix is not None: 
+        if args.id_to_fix not in allAffected:
+            print(f"{args.id_to_fix} is not on the list") 
+        to_fix =  allAffected[args.id_to_fix]   
+        if to_fix["hasSecref"]:
+            print(f"{args.id_to_fix} cannot be fixed now as it contains refenences to secrets") 
+        print(f"attempt to fix: {args.id_to_fix}")     
 
 
 if __name__ == '__main__':
@@ -478,6 +603,8 @@ if __name__ == '__main__':
     parser.add_argument("--couchdb-credentials", type=str, help="CouchDB credentials in base64 format")
     parser.add_argument("--couchdb-proxy-port", type=str, help="CouchDB proxy local port number")
     parser.add_argument("--project-id", type=str, help="project-id")
+    parser.add_argument("--id-to-fix", type=str, help="id-to-fix")
+    parser.add_argument("--pipeline-id", type=str, help="pipeline-id")
     parser.add_argument("--host", type=str, help="Cluster host")
     parser.add_argument("--oc-path", type=str, help="OpenShift Client path")
 
@@ -487,7 +614,7 @@ if __name__ == '__main__':
         print(f"Missing --host parameter. Please provide cluster host.")
         exit(1)
     if args.host.endswith('/'):
-        args.host = args.host[:-1]
+        args.host = args.host[:-1]   
     if args.namespace is None:
         print(f"Missing --namespace parameter. Using default: {CPD_INSTANCE}.")
         args.namespace = CPD_INSTANCE
@@ -515,3 +642,4 @@ if __name__ == '__main__':
     with forward_couchdb_port(args) as proxy_proc:
         run_migration(args)
         proxy_proc.terminate()
+
