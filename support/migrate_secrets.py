@@ -24,13 +24,16 @@ import socketserver
 import requests
 from requests.adapters import HTTPAdapter
 import urllib3
+from datetime import datetime
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 PIPELINES_DIR = "pipelines"
+PROJECTS_DIR = "projects"
 CPD_INSTANCE = "cpd-instance"
 CPD_ADMIN_ID = "1000331001"
 CPD_ADMIN_NAME = "cpadmin"
+CREDENTIALS_DIR = "creds"
 
 session = requests.Session()
 retry = urllib3.Retry(connect=3, backoff_factor=0.5)
@@ -39,6 +42,11 @@ session.mount('http://', adapter)
 session.mount('https://', adapter)
 session.verify = False
 
+all_affected = {}
+flows = {}
+assets_to_primary = {}
+primary_to_creds = {}
+primary_to_plan = {}
 
 def get_user_token(args, user_id, username):
     params = {
@@ -342,7 +350,7 @@ def generate_token(args):
 
 def get_service_broker_token_from_secret(args):
     get_secret_cmd = [args.oc_path, "-n", args.namespace, "get", "secret", "zen-service-broker-secret", "--output", "json"]
-    result = subprocess.run(get_secret_cmd, check=True, capture_output=True)
+    result = subprocess.run(get_secret_cmd, check=True, stdout=subprocess.PIPE)
     service_secret = json.loads(result.stdout)
     token_encoded = service_secret.get("data", {}).get("token", None)
     if token_encoded is None:
@@ -352,7 +360,7 @@ def get_service_broker_token_from_secret(args):
 
 def get_couchdb_credentials_from_secret(args):
     get_secret_cmd = [args.oc_path, "-n", args.namespace, "get", "secret", "wdp-couchdb", "--output", "json"]
-    result = subprocess.run(get_secret_cmd, check=True, capture_output=True)
+    result = subprocess.run(get_secret_cmd, check=True, stdout=subprocess.PIPE)
     service_secret = json.loads(result.stdout)
     adminPassword64 = service_secret.get("data", {}).get("adminPassword", None)
     adminUsername64 = service_secret.get("data", {}).get("adminUsername", None)
@@ -379,7 +387,7 @@ def forward_couchdb_port(args):
 
 def get_couchdb_url_from_secret(args, namespace):
     get_secret_cmd = [args.oc_path, "-n", namespace, "get", "secret", "couchdb-url", "--output", "json"]
-    result = subprocess.run(get_secret_cmd, check=True, capture_output=True)
+    result = subprocess.run(get_secret_cmd, check=True, stdout=subprocess.PIPE)
     service_secret = json.loads(result.stdout)
     adminPassword = service_secret.get("data", {}).get("adminPassword", None)
     adminUsername = service_secret.get("data", {}).get("adminUsername", None)
@@ -407,11 +415,230 @@ def patch_credentials_scope(args, credential_id, project_id):
     if response.ok is False:
         raise Exception("Failed to put user credential. Reason: {}".format(response.text))
     return response.json()
+ 
+def get_credentials_for_asset(args, asset_id):
+    url = f"https://127.0.0.1:{args.couchdb_proxy_port}/task-credentials/_find"
+    query={
+      "selector": {
+        "$and": [
+          {
+            "scope.job_id": {
+              "$exists": False
+            }
+          },
+          {
+            "scope.asset_id": asset_id
+          }
+        ]
+      },
+      "limit": 3000
+    }
+    response = session.post(
+        url,
+        headers={'Authorization': f'Basic {args.couchdb_credentials}'},
+        json=query
+    )
+    if response.ok is False:
+        raise Exception("Failed to put get credential. Reason: {}".format(response.text))
+    return response.json()["docs"]
+
+def prepare_migration_secret(args, token):
+    fixed_asset_id = 'migration_helper'
+    url = f"https://127.0.0.1:{args.couchdb_proxy_port}/task-credentials/_find"
+    query={
+      "selector": {
+        "scope.asset_id": fixed_asset_id
+      }
+    }
+    response = session.post(
+        url,
+        headers={'Authorization': f'Basic {args.couchdb_credentials}'},
+        json=query
+    )
+    if response.ok is False:
+        raise Exception("Failed to check helper credentials. Reason: {}".format(response.text))
+    found = response.json()["docs"]
+    if len(found) > 0:
+        return found[0]["secret_id"]
+    
+    url = f"{args.host}/v1/task_credentials"
+    payload = {
+    "name": fixed_asset_id,
+    "type": "parameters",
+    "secret":{},
+    "scope": {"asset_id": fixed_asset_id}
+    }
+
+    response = session.post(
+        url,
+        headers={'Authorization': f'Bearer {token}'},
+        json=payload
+    )
+    if response.ok is False:
+        raise Exception("Failed to get create helper credentials. Reason: {}".format(response.text))
+    return prepare_migration_secret(args)
+
+def prepare_fixed_secret(args, token, migration_helper_secret, asset_id, project_id, secret):
+    current_timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
+    data = {
+      "created_at": current_timestamp,
+      "creator_id": "",
+      "name": "orchestration_flow_parameters_migrated",
+      "owner": {
+        "user_id": args.user_name
+      },
+      "scope": {
+        "asset_id": asset_id,
+        "project_id": project_id
+      },
+      "secret_id": migration_helper_secret,
+      "type": "parameters",
+      "updated_at": current_timestamp
+    }
+    fixed_asset_id = 'migration_helper'
+    url = f"https://127.0.0.1:{args.couchdb_proxy_port}/task-credentials"
+    response = session.post(
+        url,
+        headers={'Authorization': f'Basic {args.couchdb_credentials}'},
+        json=data
+    )
+    if response.ok is False:
+        return "failure : could not create base record. Reason: {}".format(response.text)
+    new_id = response.json()["id"]
+
+    print(f"created record for asset {asset_id} and project {project_id}: {new_id}")
+
+    if len(secret) == 0:
+        return "success"
+
+    url = f"{args.host}/v1/task_credentials/{new_id}"
+    payload = [{
+        "op":"replace",
+        "path":"/secret",
+        "value": secret
+    }]
+
+    response = session.patch(
+        url,
+        headers={'Authorization': f'Bearer {token}'},
+        json=payload
+    )
+    if response.ok is False:
+        return "failure: could not patch the record. Reason: {}".format(response.text)
+    print(f"record ${new_id} patched : {response.json()}")
+    return "success"
+
+def extract_secret_payload(args, flow):
+    inputs=flow["pipelines"][0]["app_data"]["pipeline_data"]["inputs"]
+    payload={}
+    for inp in inputs:
+        if "default" in inp and "{encval}" in inp["default"]:
+            payload[inp["name"]]=inp["default"]
+    return payload
+
+def is_scope_set_in_latest_creds(args, project_id, asset_id, token):
+    response = get_user_credentials(args, project_id, asset_id, token, next_page = None)
+    creds=response["credentials"]
+    print(creds, len(creds))
+    if len(creds) > 0:
+        last = creds[0]
+        return "project_id" not in last["scope"]
+    return false    
+
+def prepare_fix_plan(args, affected, creds):
+    ppid = affected["primary_pipeline_id"]
+    actions = []
+    if affected["hasSecref"]:
+        actions.append({
+            "action":"break",
+            "reason":"cannot be fixed now as it contains refenences to secrets"
+        })
+        return actions
+    if not affected["hasEncval"] and not affected["hasSecref"]: 
+        actions.append({
+            "action":"break",
+            "reason":"nothing to fix"
+        })
+        return actions    
+    if not affected["hasSecref"]:
+        fixed = []   
+        for c in creds:
+            cid = c["_id"]
+            if "project_id" in c["scope"]:
+                actions.append({
+                    "action":"skip",
+                    "reason":f"ignore scoped record: {cid}",
+                    "record": c
+                })
+                fixed.append(c["scope"]["project_id"])
+            else:
+                actions.append({
+                    "action":"disable",
+                    "reason":f"disabel unscoped record {cid}",
+                    "record": c
+                })
+        projects =  affected["projects"]  
+        for p in projects:
+            if p not in fixed:
+                actions.append({
+                    "action":"create",
+                    "reason":f"create record for asset {ppid} and project {p}",
+                    "asset_id": ppid,
+                    "project_id": p
+                })
+                fixed.append(p)
+                    
+    return actions  
+
+def disable_credentials_record(args, record):
+    credential_id = record["_id"]
+    url = f"https://127.0.0.1:{args.couchdb_proxy_port}/task-credentials/{credential_id}"
+
+    record['scope']['project_id'] = "00000000-0000-0000-0000-000000000000"
+    response = session.put(
+        url,
+        headers={'Authorization': f'Basic {args.couchdb_credentials}'},
+        json=record
+    )
+    if response.ok is False:
+        return "failure: {}".format(response.text)
+    return "success"
+
+def execute_disable_action(args, action, admin_token):
+    record = action["record"]
+    return disable_credentials_record(args, record)
+
+def execute_create_action(args, action, admin_token, migration_helper_secret):
+    asset_id = action["asset_id"]
+    project_id = action["project_id"]  
+    key = f"{asset_id}_at_{project_id}"
+    if key not in flows:
+       return f"ignored: {asset_id} is not in the project {project_id}"
+    else:
+       payload=extract_secret_payload(args, flows[key])
+       print(f"attempt to fix: {asset_id} in project {project_id} : {len(payload)} parameters")
+       return prepare_fixed_secret(args, admin_token, migration_helper_secret, asset_id, project_id, payload)   
+
+def execute_plan(args, affected, actions, admin_token, migration_helper_secret):
+    for a in actions: 
+        action = a["action"]
+        reason = a["reason"]
+        if action == "disable":
+            print(f"execute disable action")
+            rsp = execute_disable_action(args, a, admin_token)   
+            print(f"execute disable action completed with status {rsp}")
+        if action == "create":
+            print(f"execute create action")
+            rsp = execute_create_action(args, a, admin_token, migration_helper_secret)  
+            print(f"execute create action completed with status {rsp}")              
 
 
 def run_migration(args):
     admin_token = args.user_token
-    pathlib.Path(PIPELINES_DIR).mkdir(parents=True, exist_ok=True)
+    pathlib.Path(f"{CREDENTIALS_DIR}").mkdir(parents=True, exist_ok=True)
+
+    migration_helper_secret = prepare_migration_secret(args, admin_token)
+    print(f"migration_helper_secret = {migration_helper_secret}")
 
     if args.project_id is None:
         projects = get_all_projects(args, admin_token)
@@ -426,39 +653,65 @@ def run_migration(args):
             continue
 
         print(f"Processing project {project_id}")
+        pathlib.Path(f"{PROJECTS_DIR}/{project_id}/{PIPELINES_DIR}").mkdir(parents=True, exist_ok=True)
         pipelines = get_all_pipelines(args, admin_token, project_id)
         if pipelines == {}:
             continue
+        for asset_id, flow in pipelines.items():
+            dump = json.dumps(flow, indent=2)
+            with open(f"{PROJECTS_DIR}/{project_id}/{PIPELINES_DIR}/{asset_id}.json", "w") as f:
+                f.write(dump)
+            hasSecref = "{secref}" in dump
+            hasEncval = "{encval}" in dump   
+            primary_pipeline_id = flow['primary_pipeline'] 
+            assets_to_primary[asset_id] = primary_pipeline_id
+            print(f"pipeline: {asset_id}, primary_pipeline_id: {primary_pipeline_id}, secret refs: {hasSecref}, encrypted vals: {hasEncval}")
+            if hasSecref or hasEncval:
+                affected = {
+                    "primary_pipeline_id": primary_pipeline_id,
+                    "hasSecref": hasSecref,
+                    "hasEncval": hasEncval,
+                    "projects": [project_id]
+                }
+                flows[f"{primary_pipeline_id}_at_{project_id}"] = flow
+                if primary_pipeline_id not in all_affected:
+                    all_affected[primary_pipeline_id] = affected  
+                else:
+                    existing = all_affected[primary_pipeline_id]
+                    existing["hasSecref"] = existing["hasSecref"] or affected["hasSecref"]
+                    existing["hasEncval"] = existing["hasEncval"] or affected["hasEncval"]
+                    existing["projects"].append(project_id)
+
+                
         primary_pipelines = {flow['primary_pipeline']: asset_id for asset_id, flow in pipelines.items()}
-        members = get_project_members(args, admin_token, project_id)
-        for member in members:
-            uid = member.get('id')
-            username = member.get("user_name")
-            print(f"\tProcessing member {uid}: {username}")
-            user_token = get_user_token(args, uid, username)
-            credentials = get_all_user_credentials(args, project_id, None, user_token)
-            for credential in credentials:
-                owner = credential.get('owner', {})
-                if owner['user_id'] == username:
-                    scope = credential.get('scope', {})
-                    id = credential.get('id')
-                    name = credential.get('name')
-                    secret = get_secret(args, id, user_token)
-                    primary_pipeline = scope.get('asset_id')
-                    asset_id = primary_pipelines.get(primary_pipeline)
-                    if asset_id is not None:
-                      print(f"\t\tProcessing credential {credential}")
-                      print(f"\t\tSecret {id}: {secret}")
+        print(f"project: {project_id} - done")
 
-                      if 'project_id' not in scope:
-                        patch_response = patch_credentials_scope(args, id, project_id)
-                        patched_credentials = get_credentials_by_id(args, id, user_token)
-                        print(f"\t\tPatched credentials {id}: {patched_credentials}")
-                      else:
-                        print("\t\tProject scope already set")
+    print(f"projects - done\n")
 
-    print("Done processing all projects")
+    for ppid in all_affected:
+        affceted = all_affected[ppid]
+        if args.primary_pipeline_id is not None and args.primary_pipeline_id != ppid:
+            continue
+        print(f"affected pipeline: {affceted} {args.primary_pipeline_id}")
+        creds = get_credentials_for_asset(args, ppid)
+        primary_to_creds[ppid] = creds
+        dump=json.dumps(creds)
+        with open(f"{CREDENTIALS_DIR}/{ppid}_secrets.json", "w") as f:
+            f.write(dump) 
+        actions = prepare_fix_plan(args, affceted, creds)
+        primary_to_plan[ppid] = actions
+        print("fix plan:")
+        for a in actions: 
+            action = a["action"]
+            reason = a["reason"]
+            print(f"action: {action}, reason: {reason}")
+        if args.fix:
+            print("execute fix plan start:")
+            execute_plan(args, affected, actions, admin_token, migration_helper_secret)  
+            print("execute fix plan done")  
 
+    print("affected - done\n")
+                 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -470,6 +723,9 @@ if __name__ == '__main__':
     parser.add_argument("--couchdb-credentials", type=str, help="CouchDB credentials in base64 format")
     parser.add_argument("--couchdb-proxy-port", type=str, help="CouchDB proxy local port number")
     parser.add_argument("--project-id", type=str, help="project-id")
+    parser.add_argument("--primary-pipeline-id", type=str, help="primary-pipeline-id")
+    parser.add_argument("--fix", action='store_true')
+    parser.add_argument("--pipeline-id", type=str, help="pipeline-id")
     parser.add_argument("--host", type=str, help="Cluster host")
     parser.add_argument("--oc-path", type=str, help="OpenShift Client path")
 
@@ -478,8 +734,11 @@ if __name__ == '__main__':
     if args.host is None:
         print(f"Missing --host parameter. Please provide cluster host.")
         exit(1)
+    if args.fix is None:
+        print(f"Missing --fix. Using default: false.")
+        args.fix = False
     if args.host.endswith('/'):
-        args.host = args.host[:-1]
+        args.host = args.host[:-1]   
     if args.namespace is None:
         print(f"Missing --namespace parameter. Using default: {CPD_INSTANCE}.")
         args.namespace = CPD_INSTANCE
@@ -504,6 +763,10 @@ if __name__ == '__main__':
         print(f"Getting CouchDB proxy port...")
         args.couchdb_proxy_port = get_free_port_for_proxy()
 
+    print("fix flag is set to:", args.fix)
+    print("primary_pipeline_id is set to:", args.primary_pipeline_id)
+
     with forward_couchdb_port(args) as proxy_proc:
         run_migration(args)
         proxy_proc.terminate()
+
