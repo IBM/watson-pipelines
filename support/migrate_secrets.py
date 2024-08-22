@@ -531,6 +531,14 @@ def prepare_fixed_secret(args, token, migration_helper_secret, asset_id, project
     return "success"
 
 def extract_secret_payload(args, flow):
+    if "pipelines" not in flow:
+        return {}
+    if len(flow["pipelines"]) == 0:
+        return {}        
+    if "pipeline_data" not in flow["pipelines"][0]["app_data"]:
+        return {}
+    if "inputs" not in flow["pipelines"][0]["app_data"]["pipeline_data"]:
+        return {}   
     inputs=flow["pipelines"][0]["app_data"]["pipeline_data"]["inputs"]
     payload={}
     for inp in inputs:
@@ -794,7 +802,6 @@ if __name__ == '__main__':
 
     print("fix flag is set to:", args.fix)
     print("primary_pipeline_id is set to:", args.primary_pipeline_id) 
-
 
     with forward_couchdb_port(args) as proxy_proc:
         run_migration(args)
