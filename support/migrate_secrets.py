@@ -668,7 +668,6 @@ def run_migration(args):
     migration_helper_secret = prepare_migration_secret(args, admin_token)
     print(f"migration_helper_secret = {migration_helper_secret}")
 
-
     if args.project_id is None:
         projects = get_all_projects(args, admin_token)
     else:
@@ -735,6 +734,7 @@ def run_migration(args):
             reason = a["reason"]
             print(f"action: {action}, reason: {reason}")
         if args.fix:
+            admin_token = get_user_token(args, args.user_id, args.user_name)
             print("execute fix plan start:")
             execute_plan(args, affected, actions, admin_token, migration_helper_secret)  
             print("execute fix plan done")  
