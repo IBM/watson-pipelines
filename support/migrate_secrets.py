@@ -25,6 +25,7 @@ import requests
 from requests.adapters import HTTPAdapter
 import urllib3
 from datetime import datetime
+import time
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
@@ -459,7 +460,7 @@ def prepare_migration_secret(args, token):
         raise Exception("Failed to check helper credentials. Reason: {}".format(response.text))
     found = response.json()["docs"]
     if len(found) > 0:
-        return found[0]["secret_id"]
+        return found[0]["secret_id"] 
     
     url = f"{args.host}/v1/task_credentials"
     payload = {
@@ -480,6 +481,7 @@ def prepare_migration_secret(args, token):
 
 def prepare_fixed_secret(args, token, migration_helper_secret, asset_id, project_id, secret):
     current_timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
+    secret_urn = prepare_empty_secret(args, token)
     data = {
       "created_at": current_timestamp,
       "creator_id": "",
@@ -491,7 +493,7 @@ def prepare_fixed_secret(args, token, migration_helper_secret, asset_id, project
         "asset_id": asset_id,
         "project_id": project_id
       },
-      "secret_id": migration_helper_secret,
+      "secret_id": secret_urn,
       "type": "parameters",
       "updated_at": current_timestamp
     }
@@ -632,6 +634,32 @@ def execute_plan(args, affected, actions, admin_token, migration_helper_secret):
             rsp = execute_create_action(args, a, admin_token, migration_helper_secret)  
             print(f"execute create action completed with status {rsp}")              
 
+def prepare_empty_secret(args, token):
+    print("attempt to create empty secret")
+    url = f"{args.host}/zen-data/v2/secrets"
+    payload = {
+        "secret_name":f"migration-helper-{datetime.now().strftime('%s-%f')}",
+        "type":"generic",
+        "vault_urn": "0000000000:internal",
+        "secret": {
+            "generic": {
+                "task_credentials_empty_secret_param": "placeholder"
+            }
+        }
+    }
+
+    response = session.post(
+        url,
+        headers={'Authorization': f'Bearer {token}'},
+        json=payload
+    )
+    if response.ok is False:
+        raise Exception("Could not create empty secret. Reason: {}".format(response.text))
+        return ""
+    secret_urn = response.json()["secret_urn"]
+    print(f"secret {secret_urn} created : {response.json()}")
+    return secret_urn   
+
 
 def run_migration(args):
     admin_token = args.user_token
@@ -639,6 +667,7 @@ def run_migration(args):
 
     migration_helper_secret = prepare_migration_secret(args, admin_token)
     print(f"migration_helper_secret = {migration_helper_secret}")
+
 
     if args.project_id is None:
         projects = get_all_projects(args, admin_token)
