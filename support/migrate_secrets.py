@@ -534,7 +534,7 @@ def extract_secret_payload(args, flow):
     inputs=flow["pipelines"][0]["app_data"]["pipeline_data"]["inputs"]
     payload={}
     for inp in inputs:
-        if "default" in inp and "{encval}" in inp["default"]:
+        if "default" in inp and isinstance(inp["default"], str) and "{encval}" in inp["default"]:
             payload[inp["name"]]=inp["default"]
     return payload
 
@@ -793,7 +793,8 @@ if __name__ == '__main__':
         args.couchdb_proxy_port = get_free_port_for_proxy()
 
     print("fix flag is set to:", args.fix)
-    print("primary_pipeline_id is set to:", args.primary_pipeline_id)
+    print("primary_pipeline_id is set to:", args.primary_pipeline_id) 
+
 
     with forward_couchdb_port(args) as proxy_proc:
         run_migration(args)
