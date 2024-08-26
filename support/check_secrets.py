@@ -727,10 +727,15 @@ def run_migration(args):
     else:
         projects = get_project(args, admin_token)
 
+
+    project_guids = set()    
     for project in projects:
         project_id = project.get('metadata').get('guid')
         project_name = project.get('entity').get('name')
+        project_guids.add(project_id)
         print(f"found project {project_id} : {project_name}")
+
+    print(f"\nList of projects: {project_guids}\n")    
 
     creds_per_asset = {}
     unscoped_ids = set()
@@ -751,13 +756,21 @@ def run_migration(args):
     for ppid in list(creds_per_asset.keys()):
         if ppid not in unscoped_ids:
             del(creds_per_asset[ppid])
-    print(f"\nunscoped found: {len(creds_per_asset)}")
+    print(f"\nunscoped found: {len(creds_per_asset)}\n")
 
+    iter = 1
     for ppid, lst in creds_per_asset.items():
-        print(f"------- dump for {ppid} ------")
+        refernced_projects = set()
+        for lc in lst:
+            if "project_id" in lc["scope"]:
+                refernced_projects.add(lc["scope"]["project_id"])
+        print(f"------- {iter}/{len(creds_per_asset)} dump for {ppid} refernced projects: {refernced_projects} ------")
+        iter+=1
         lst.sort(key=cred_timestamp, reverse=True)
         master = None
         for lc in lst:
+            if "project_id" in lc["scope"]:
+                refernced_projects.add(lc["scope"]["project_id"])
             if master is None and "project_id" not in lc["scope"]:
                 master = lc
             print(f"---> {lc}")     
@@ -769,6 +782,7 @@ def run_migration(args):
         token = get_user_token(args, owener_id, owner_name)
         secret = get_secret(secret_id, token)
         print(f"values: {secret.keys()}")
+        print()
             
     print(f"DONE")             
 
