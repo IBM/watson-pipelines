@@ -697,8 +697,8 @@ def get_all_pipeline_secrets(args):
 
 def cred_timestamp(cred):
     if "updated_at" in cred:
-        return datetime.strptime(cred["updated_at"],"%Y-%m-%dT%H:%M:%SZ")
-    return datetime.strptime(cred["created_at"],"%Y-%m-%dT%H:%M:%SZ")   
+        return cred["updated_at"]
+    return cred["created_at"]
 
 def get_secret(secret_id, token):
     print("attempt to get secret")
