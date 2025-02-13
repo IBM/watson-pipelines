@@ -1,7 +1,7 @@
 # TBD change for official registry
 OPERATOR_REGISTRY="icr.io/cpopen"
 # TBD change for official builded digest
-OPERATOR_DIGEST="TBD"
+OPERATOR_DIGEST="TBD:sha256"
 DATASTAGE_PVC=""
 PHYSICAL_LOCATION_NAME=""
 PHYSICAL_LOCATION_ID=""
