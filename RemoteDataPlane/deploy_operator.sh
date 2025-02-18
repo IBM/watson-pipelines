@@ -1,7 +1,5 @@
-# TBD change for official registry
 OPERATOR_REGISTRY="icr.io/cpopen"
-# TBD change for official builded digest
-OPERATOR_DIGEST="TBD:sha256"
+OPERATOR_DIGEST="576bac3e650b6caceeb87f17727ef02a5df971cd1452d0d26eb1c59c5e43bf7e"
 DATASTAGE_PVC=""
 PHYSICAL_LOCATION_NAME=""
 PHYSICAL_LOCATION_ID=""
@@ -302,7 +300,7 @@ spec:
             - "6"
             - "--watches-file"
             - "./runtime-watch.yaml"
-          image: ${OPERATOR_REGISTRY}/ibm-cpd-wspipelines-operator:${OPERATOR_DIGEST}
+          image: ${OPERATOR_REGISTRY}/ibm-cpd-wspipelines-operator@sha256:${OPERATOR_DIGEST}
           imagePullPolicy: IfNotPresent
           livenessProbe:
             httpGet:
