@@ -57,4 +57,3 @@ Orchestration Pipelines is upgraded when the update-cr command returns:
 ```
 [SUCCESS]... The update-cr command ran successfully
 ```
-
