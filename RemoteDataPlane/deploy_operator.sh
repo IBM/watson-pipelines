@@ -101,7 +101,7 @@ read_location_info() {
   WORKLOAD_NS=$(oc get cm physical-location-info-cm -n $namespace -ojsonpath='{.data.WORKLOAD_NS}')
 }
 
-upgrade_orchestrationruntimes() {
+upgrade_orchestration_runtimes() {
   # upgrade pxruntime instaces to the same version
   instance_count=`oc -n $namespace get orchestrationruntime 2> /dev/null | wc -l | tr -d ' '`
   if [ $instance_count -gt 0 ]; then
@@ -544,4 +544,4 @@ create_operator_deployment
 create_cr_role
 create_cr_role_binging
 create_cr_deployment
-upgrade_orchestrationruntimes
+upgrade_orchestration_runtimes
