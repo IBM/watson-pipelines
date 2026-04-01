@@ -25,6 +25,7 @@ import requests
 from requests.adapters import HTTPAdapter
 import urllib3
 from datetime import datetime
+from datetime import timezone
 import time
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -50,6 +51,15 @@ primary_to_creds = {}
 primary_to_plan = {}
 
 
+def parse_isotimestamp_or_none(date_string):
+    try:
+        return datetime.fromisoformat(date_string)
+    except ValueError:
+        return None
+    except OSError:
+        return None
+
+
 def get_user_token(args, user_id, username):
     params = {
         'uid': user_id,
@@ -61,8 +71,15 @@ def get_user_token(args, user_id, username):
         params=params
     )
     if response.ok is False:
+        raise Exception("Failed to get timed user token. Reason: {}".format(response.text))
+    base_token = response.json()['token']
+    response = session.post(
+        f"{args.host}/usermgmt/v1/usermgmt/getTimedToken",
+        headers={'Authorization': "Bearer {}".format(base_token), 'lifetime': '24'},
+    )
+    if response.ok is False:
         raise Exception("Failed to get user token. Reason: {}".format(response.text))
-    return response.json()['token']
+    return response.json()['accessToken']
 
 
 def get_projects(args, token, bookmark=None):
@@ -692,7 +709,7 @@ def get_all_pipeline_secrets(args):
         "selector": {
             "$and": [
                 {
-                    "scope.run_id": {
+                    "scope.asset_id": {
                         "$exists": True
                     }
                 },
@@ -739,43 +756,94 @@ def get_secret(secret_id, token):
     return response.json()["data"]["secret"]["generic"]
 
 
+def get_task_credentials_secrets_with_token(args, token):
+    more = True
+    batch_size = 200
+    offset = 0
+    all_secrets = list()
+    while more:
+        response = session.get(
+            f"{args.host}/zen-data/v2/secrets?sort=created_at&offset={offset}&limit={batch_size}",
+            headers={'Authorization': "Bearer {}".format(token), 'lifetime': '24'},
+        )
+        if response.ok is False:
+            raise Exception("Failed to fetch secrets at offset {}. Reason: {}".format(offset, response.text))
+        offset += batch_size
+        secrets = response.json()['secrets']
+        if len(secrets) < batch_size:
+            more = False
+            print("#")
+        else:
+            print("#", end="")
+        for secret in secrets:
+            all_secrets.append(secret)
+    return all_secrets
+
+
+def clean_for_user(args, user, pipeline_secrets_ids, run_secrets_ids):
+    print(f"Scan vault for secrets for {user}")
+    grace_period = 22 * 60 * 60
+    token = get_user_token(args, user, "cleanup")
+    user_secrets = get_task_credentials_secrets_with_token(args, token)
+    secrets_to_delete = set(())
+    print("Found {} secrets created by task credentials for user {}".format(len(user_secrets), user))
+    for secret in user_secrets:
+        if secret.get("description") == "created by task_credential service":
+            if secret["secret_urn"] in pipeline_secrets_ids:
+                print("Preserve (pipeline secret)", secret)
+            else:
+                created_at = parse_isotimestamp_or_none(secret["created_at"])
+                if created_at is not None:
+                    diff_seconds = (datetime.now(timezone.utc) - created_at).total_seconds()
+                    if diff_seconds < grace_period:
+                        print("Skip (grace period)", secret)
+                    else:
+                        print("Delete (run secret)", secret)
+                        secrets_to_delete.add(secret["secret_urn"])
+                else:
+                    print("Skip (could not determine timestamp)", secret)
+
+        else:
+            print("Preserve (not a task credential secret)", secret)
+
+
 def run_cleanup(args):
     admin_token = args.user_token
     pathlib.Path(f"{CREDENTIALS_DIR}").mkdir(parents=True, exist_ok=True)
 
-    if args.project_id is None:
-        projects = get_all_projects(args, admin_token)
-    else:
-        projects = get_project(args, admin_token)
+    print("Scan couchDB for secrets metadata...")
 
-    project_guids = set()
-    for project in projects:
-        project_id = project.get('metadata').get('guid')
-        project_name = project.get('entity').get('name')
-        project_guids.add(project_id)
-        print(f"found project {project_id} : {project_name}")
-
-    print(f"\nList of projects: {project_guids}\n")
-
-    scoped_ids = list()
+    run_secrets_ids = list()
+    pipeline_secrets_ids = list()
+    users = set(())
     creds = get_all_pipeline_secrets(args)
     for cred in creds:
         cred_id = cred["_id"]
         project_id = cred["scope"].get("project_id")
         run_id = cred["scope"].get("run_id")
         secret_id = cred["secret_id"]
+        obj = {
+            "cred_id": cred_id,
+            "secret_id": secret_id,
+            "project_id": project_id,
+            "run_id": run_id,
+        }
+        users.add(secret_id.split(":")[0])
 
         if run_id is not None and run_id != "PROJDEF":
-            obj = {
-                "cred_id": cred_id,
-                "secret_id": secret_id,
-                "project_id": project_id,
-                "run_id": run_id,
-            }
-            print(f"found run scoped credentials object: {obj}\n")
-            scoped_ids.append(obj)
+            run_secrets_ids.append(obj["secret_id"])
+            print("Run secret:", obj)
+        else:
+            pipeline_secrets_ids.append(obj["secret_id"])
+            print("Pipeline secret:", obj)
 
-    print(f"\nscoped found: {len(scoped_ids)}\n")
+    print("Metadata summary")
+    print(f"Run secrets: {len(run_secrets_ids)}, Pipeline secrets: {len(pipeline_secrets_ids)}")
+    print(f"Users: {users}")
+
+    for user in users:
+        clean_for_user(args, user, pipeline_secrets_ids, run_secrets_ids)
+
     print(f"DONE")
 
 
