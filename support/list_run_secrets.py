@@ -782,11 +782,11 @@ def get_task_credentials_secrets_with_token(args, token):
 
 def clean_for_user(args, user, pipeline_secrets_ids, run_secrets_ids):
     print(f"Scan vault for secrets for {user}")
-    grace_period = 22 * 60 * 60
+    grace_period = 24 * 60 * 60
     token = get_user_token(args, user, "cleanup")
     user_secrets = get_task_credentials_secrets_with_token(args, token)
     secrets_to_delete = set(())
-    print("Found {} secrets created by task credentials for user {}".format(len(user_secrets), user))
+    print("Found {} secrets for user {}".format(len(user_secrets), user))
     for secret in user_secrets:
         if secret.get("description") == "created by task_credential service":
             if secret["secret_urn"] in pipeline_secrets_ids:
