@@ -628,7 +628,7 @@ def is_scope_set_in_latest_creds(args, project_id, asset_id, token):
     if len(creds) > 0:
         last = creds[0]
         return "project_id" not in last["scope"]
-    return false
+    return False
 
 
 def prepare_fix_plan(args, affected, creds):
@@ -751,31 +751,43 @@ def prepare_empty_secret(args, token):
 
 
 def get_all_pipeline_secrets(args):
+    all_docs = list()
+    limit = 5000
+    bookmark = ""
     url = f"https://127.0.0.1:{args.couchdb_proxy_port}/task-credentials/_find"
-    query = {
-        "selector": {
-            "$and": [
-                {
-                    "scope.asset_id": {
-                        "$exists": True
+    while True:
+        print(f"read up to {limit} records from couchdb starting at bookmark {bookmark}")
+        query = {
+            "selector": {
+                "$and": [
+                    {
+                        "scope.asset_id": {
+                            "$exists": True
+                        }
+                    },
+                    {
+                        "type": "parameters"
                     }
-                },
-                {
-                    "type": "parameters"
-                }
-            ]
-        },
-        "limit": 5000
-    }
-    response = session.post(
-        url,
-        headers={'Authorization': f'Basic {args.couchdb_credentials}'},
-        json=query
-    )
-    if response.ok is False:
-        print("Failed to get credentials. Reason: {}".format(response.text))
-        raise Exception("Failed to get credentials. Reason: {}".format(response.text))
-    return response.json()["docs"]
+                ]
+            },
+            "limit": limit,
+            "bookmark": bookmark
+        }
+        response = session.post(
+            url,
+            headers={'Authorization': f'Basic {args.couchdb_credentials}'},
+            json=query
+        )
+        if response.ok is False:
+            print("Failed to get credentials. Reason: {}".format(response.text))
+            raise Exception("Failed to get credentials. Reason: {}".format(response.text))
+        batch = response.json()["docs"]
+        all_docs.extend(batch)
+        bookmark = response.json()["bookmark"]
+        if len(batch) < limit:
+            break
+
+    return all_docs
 
 
 def cred_timestamp(cred):
@@ -833,6 +845,7 @@ def clean_for_user(args, user, pipeline_secrets_ids, run_secrets_ids):
     token = get_user_token(args, user, "cleanup")
     user_secrets = get_task_credentials_secrets_with_token(args, token)
     secrets_to_delete = set(())
+    credentials_to_delete = set(())
     print("Found {} secrets for user {}".format(len(user_secrets), user))
     for secret in user_secrets:
         if secret.get("description") == "created by task_credential service":
@@ -840,10 +853,13 @@ def clean_for_user(args, user, pipeline_secrets_ids, run_secrets_ids):
                 print("Preserve (pipeline secret)", secret)
                 preserved_logger.info(f"{secret}")
             elif secret["secret_urn"] in run_secrets_ids:
-                if args.delete_run_secrets:
+                if args.mark_run_secrets_for_delete:
                     print("Delete (run secret)", secret)
                     deletion_logger.info(f"{secret}")
-                    secrets_to_delete.add(secret["secret_urn"])
+                    # secrets_to_delete.add(secret["secret_urn"])
+                    cred_id = run_secrets_ids[secret["secret_urn"]]
+                    print(f"mark credential object {cred_id} to delete")
+                    credentials_to_delete.add(cred_id)
                 else:
                     print("Preserve (run secret)", secret)
                     preserved_logger.info(f"{secret}")
@@ -857,10 +873,22 @@ def clean_for_user(args, user, pipeline_secrets_ids, run_secrets_ids):
     # Only delete secrets if the --delete-secrets flag is set
     if args.delete_secrets:
         print(f"Deleting {len(secrets_to_delete)} secrets for user {user}...")
+        current = 1
+        total = len(secrets_to_delete)
         for secret_to_delete in secrets_to_delete:
+            print(f"Deleting {current} of {total}")
+            current += 1
             delete_secret(secret_to_delete, token)
+        print(f"Deleting {len(credentials_to_delete)} credential objects for user {user}...")
+        current = 1
+        total = len(credentials_to_delete)
+        for credential_to_delete in credentials_to_delete:
+            print(f"Deleting {current} of {total}")
+            current += 1
+            delete_credentials_object(credential_to_delete, token)
     else:
-        print(f"Dry run mode: {len(secrets_to_delete)} secrets can be deleted for user {user}")
+        print(f"Dry run mode: {len(secrets_to_delete)} secrets and {len(credentials_to_delete)} credentials objects "
+              f"can be deleted for user {user}")
 
 
 def delete_secret(secret_to_delete, token):
@@ -890,14 +918,41 @@ def delete_secret(secret_to_delete, token):
     return response.ok
 
 
+def delete_credentials_object(id_to_delete, token):
+    """
+    Delete a secret from the task credentials service.
+    (make a DELETE request to /v1/task_credentials/{id})
+
+    Args:
+        id_to_delete: ID to delete
+        token: Bearer token for authentication
+    """
+    url = f"{args.host}/v1/task_credentials/{id_to_delete}"
+
+    print(f"Attempting to delete task credentials object: {id_to_delete}")
+
+    response = session.delete(
+        url,
+        headers={'Authorization': f'Bearer {token}'}
+    )
+
+    if response.ok:
+        print(f"Successfully deleted: {id_to_delete}")
+    else:
+        # Log the error but don't raise exception to continue with other deletions
+        print(f"Failed to delete {id_to_delete}. Status: {response.status_code}, Reason: {response.text}")
+
+    return response.ok
+
+
 def run_cleanup(args):
     admin_token = args.user_token
     pathlib.Path(f"{CREDENTIALS_DIR}").mkdir(parents=True, exist_ok=True)
 
     print("Scan couchDB for secrets metadata...")
 
-    run_secrets_ids = list()
-    pipeline_secrets_ids = list()
+    run_secrets_ids = {}
+    pipeline_secrets_ids = {}
     users = set(())
     creds = get_all_pipeline_secrets(args)
     for cred in creds:
@@ -914,11 +969,11 @@ def run_cleanup(args):
         users.add(secret_id.split(":")[0])
 
         if run_id is not None and run_id != "PROJDEF":
-            run_secrets_ids.append(obj["secret_id"])
+            run_secrets_ids[obj["secret_id"]] = obj["cred_id"]
             print("Run secret:", obj)
             pipeline_run_logger.info(f"{obj}")
         else:
-            pipeline_secrets_ids.append(obj["secret_id"])
+            pipeline_secrets_ids[obj["secret_id"]] = obj["cred_id"]
             print("Pipeline secret:", obj)
             pipeline_logger.info(f"{obj}")
 
@@ -949,7 +1004,7 @@ if __name__ == '__main__':
     parser.add_argument("--oc-path", type=str, help="OpenShift Client path")
     parser.add_argument("--delete-secrets", action='store_true',
                         help="Actually delete secrets (default is dry-run mode)")
-    parser.add_argument("--delete-run-secrets", action='store_true',
+    parser.add_argument("--mark-run-secrets-for-delete", action='store_true',
                         help="Delete also run secrets (default is false)")
 
     args = parser.parse_args()
@@ -989,7 +1044,7 @@ if __name__ == '__main__':
     print("fix flag is set to:", args.fix)
     print("primary_pipeline_id is set to:", args.primary_pipeline_id)
     print(f"Delete secrets mode: {args.delete_secrets}")
-    print(f"Delete run secrets mode: {args.delete_run_secrets}")
+    print(f"Delete run secrets mode: {args.mark_run_secrets_for_delete}")
 
     # Initialize log files to clear old data
     initialize_log_files()
