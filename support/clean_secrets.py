@@ -958,6 +958,7 @@ def run_cleanup(args):
     for cred in creds:
         cred_id = cred["_id"]
         project_id = cred["scope"].get("project_id")
+        asset_id = cred["scope"].get("asset_id")
         run_id = cred["scope"].get("run_id")
         secret_id = cred["secret_id"]
         obj = {
@@ -965,6 +966,7 @@ def run_cleanup(args):
             "secret_id": secret_id,
             "project_id": project_id,
             "run_id": run_id,
+            "asset_id": asset_id,
         }
         users.add(secret_id.split(":")[0])
 
